@@ -1898,17 +1898,14 @@ def main() -> None:
                     train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                     for _ in range(grad_accum_steps)
                 ]
-            with _LATENCY_PROFILER.section("train_forward"):
-                losses = []
-                for micro_step, (x, y) in enumerate(batches):
-                    if distributed:
-                        model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+            for micro_step, (x, y) in enumerate(batches):
+                if distributed:
+                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                with _LATENCY_PROFILER.section("train_forward"):
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                         loss = model(x, y)
-                    losses.append(loss)
                     train_loss += loss.detach()
-            with _LATENCY_PROFILER.section("train_backward"):
-                for loss in losses:
+                with _LATENCY_PROFILER.section("train_backward"):
                     (loss * grad_scale).backward()
             with _LATENCY_PROFILER.section("optimizer_step"):
                 for opt in optimizers:
