@@ -7,6 +7,7 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 from __future__ import annotations
 
 import copy
+import contextlib
 import glob
 import io
 import lzma
@@ -54,6 +55,88 @@ except ImportError:  # Preferred path for efficient long-context sliding-window 
     xops = None
     LocalAttentionFromBottomRightMask = None
 
+
+class LatencyProfiler:
+    def __init__(self) -> None:
+        self.gpu_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
+        self.cpu_ms: dict[str, list[float]] = {}
+
+    def section(self, name: str):
+        return _LatencySection(self, name)
+
+    def cpu_section(self, name: str):
+        return _CpuLatencySection(self, name)
+
+    def add_cpu_ms(self, name: str, elapsed_ms: float) -> None:
+        self.cpu_ms.setdefault(name, []).append(elapsed_ms)
+
+    def add_gpu_events(self, name: str, start: torch.cuda.Event, end: torch.cuda.Event) -> None:
+        self.gpu_events.setdefault(name, []).append((start, end))
+
+    def summary_lines(self, prefix: str = "latency") -> list[str]:
+        torch.cuda.synchronize()
+        lines: list[str] = []
+        for name in sorted(self.gpu_events):
+            values = [start.elapsed_time(end) for start, end in self.gpu_events[name]]
+            if values:
+                total = sum(values)
+                lines.append(
+                    f"{prefix}:{name} count:{len(values)} total_ms:{total:.3f} "
+                    f"avg_ms:{total / len(values):.3f}"
+                )
+        for name in sorted(self.cpu_ms):
+            values = self.cpu_ms[name]
+            if values:
+                total = sum(values)
+                lines.append(
+                    f"{prefix}:{name} count:{len(values)} total_ms:{total:.3f} "
+                    f"avg_ms:{total / len(values):.3f}"
+                )
+        return lines
+
+
+class _LatencySection:
+    def __init__(self, profiler: LatencyProfiler, name: str) -> None:
+        self.profiler = profiler
+        self.name = name
+        self.start: torch.cuda.Event | None = None
+        self.end: torch.cuda.Event | None = None
+
+    def __enter__(self):
+        self.start = torch.cuda.Event(enable_timing=True)
+        self.end = torch.cuda.Event(enable_timing=True)
+        self.start.record()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.start is None or self.end is None:
+            return
+        self.end.record()
+        self.profiler.add_gpu_events(self.name, self.start, self.end)
+
+
+class _CpuLatencySection:
+    def __init__(self, profiler: LatencyProfiler, name: str) -> None:
+        self.profiler = profiler
+        self.name = name
+        self.start = 0.0
+
+    def __enter__(self):
+        self.start = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.profiler.add_cpu_ms(self.name, 1000.0 * (time.perf_counter() - self.start))
+
+
+_LATENCY_PROFILER: LatencyProfiler | None = None
+
+
+def latency_section(name: str):
+    if _LATENCY_PROFILER is None:
+        return contextlib.nullcontext()
+    return _LATENCY_PROFILER.section(name)
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -86,6 +169,8 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     torch_compile = bool(int(os.environ.get("TORCH_COMPILE", "1")))
     grad_checkpoint_layers = bool(int(os.environ.get("GRAD_CHECKPOINT_LAYERS", "0")))
+    profile_latency = bool(int(os.environ.get("PROFILE_LATENCY", "0")))
+    profile_latency_steps = int(os.environ.get("PROFILE_LATENCY_STEPS", 20))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     post_train_quant = os.environ.get("POST_TRAIN_QUANT", "int8_zlib")
     gptq_calib_seqs = int(os.environ.get("GPTQ_CALIB_SEQS", 64))
@@ -1056,9 +1141,11 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        with latency_section("artery_attn"):
+            attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        with latency_section("artery_mlp"):
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -1203,11 +1290,15 @@ class ArterialLayer(nn.Module):
         x0: Tensor,
         residual_kv: Tensor | None = None,
     ) -> Tensor:
-        x = torch.stack(
-            [block(x[:, :, i, :], x0[:, :, i, :]) for i, block in enumerate(self.arteries)],
-            dim=2,
-        )
-        return self.mixer(x, self.artery_embed, residual_kv) if self.mixer is not None else x
+        artery_outputs = []
+        for i, block in enumerate(self.arteries):
+            with latency_section(f"artery{i}_block"):
+                artery_outputs.append(block(x[:, :, i, :], x0[:, :, i, :]))
+        x = torch.stack(artery_outputs, dim=2)
+        if self.mixer is not None:
+            with latency_section("mixer"):
+                return self.mixer(x, self.artery_embed, residual_kv)
+        return x
 
 
 class GPT(nn.Module):
@@ -1470,13 +1561,16 @@ class GPT(nn.Module):
 
     def forward_hidden(self, input_ids: Tensor) -> Tensor:
         bsz, seqlen = input_ids.shape
-        x = self.tok_emb(input_ids).view(bsz, seqlen, self.num_arteries, self.artery_dim)
-        x = F.rms_norm(x, (x.size(-1),))
+        with latency_section("embedding_norm"):
+            x = self.tok_emb(input_ids).view(bsz, seqlen, self.num_arteries, self.artery_dim)
+            x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         layer_inputs: dict[int, Tensor] = {}
         for layer_idx in range(len(self.blocks)):
-            x = self.forward_layer(layer_idx, x, x0, layer_inputs)
-        return self.final_norm(x).reshape(-1, self.num_arteries, self.artery_dim)
+            with latency_section(f"layer{layer_idx}"):
+                x = self.forward_layer(layer_idx, x, x0, layer_inputs)
+        with latency_section("final_norm"):
+            return self.final_norm(x).reshape(-1, self.num_arteries, self.artery_dim)
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         bsz, seqlen = input_ids.shape
@@ -1490,17 +1584,20 @@ class GPT(nn.Module):
         return logits.view(bsz, seqlen, -1)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor, return_val_losses: bool = False) -> Tensor:
-        x = self.forward_hidden(input_ids)
+        with latency_section("forward_hidden"):
+            x = self.forward_hidden(input_ids)
         targets = target_ids.reshape(-1)
-        logits_by_artery = self.artery_logits(x)
+        with latency_section("lm_heads"):
+            logits_by_artery = self.artery_logits(x)
         if return_val_losses:
             losses = [F.cross_entropy(logits.float(), targets, reduction="mean") for logits in logits_by_artery]
             mean_loss, geom_loss = self.merged_losses(logits_by_artery, targets)
             losses.extend((mean_loss, geom_loss))
             return torch.stack(losses)
         if self.training:
-            losses = [F.cross_entropy(logits.float(), targets, reduction="mean") for logits in logits_by_artery]
-            return torch.stack(losses).mean() * self.train_head_loss_weight
+            with latency_section("loss"):
+                losses = [F.cross_entropy(logits.float(), targets, reduction="mean") for logits in logits_by_artery]
+                return torch.stack(losses).mean() * self.train_head_loss_weight
         mean_loss, geom_loss = self.merged_losses(logits_by_artery, targets)
         if self.val_logit_merge == "mean":
             return mean_loss
@@ -1512,10 +1609,12 @@ class GPT(nn.Module):
 # -----------------------------
 
 def main() -> None:
-    global zeropower_via_newtonschulz5
+    global zeropower_via_newtonschulz5, _LATENCY_PROFILER
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.profile_latency and args.torch_compile:
+        args.torch_compile = False
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1701,7 +1800,10 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0(f"torch_compile:{args.torch_compile} grad_checkpoint_layers:{args.grad_checkpoint_layers}")
+    log0(
+        f"torch_compile:{args.torch_compile} grad_checkpoint_layers:{args.grad_checkpoint_layers} "
+        f"profile_latency:{int(args.profile_latency)} profile_latency_steps:{args.profile_latency_steps}"
+    )
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
@@ -1783,6 +1885,49 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    if args.profile_latency:
+        _LATENCY_PROFILER = LatencyProfiler()
+        model.train()
+        torch.cuda.reset_peak_memory_stats(device)
+        for profile_step in range(args.profile_latency_steps):
+            zero_grad_all()
+            train_loss = torch.zeros((), device=device)
+            with _LATENCY_PROFILER.cpu_section("data_cpu"):
+                batches = [
+                    train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                    for _ in range(grad_accum_steps)
+                ]
+            with _LATENCY_PROFILER.section("train_forward"):
+                losses = []
+                for micro_step, (x, y) in enumerate(batches):
+                    if distributed:
+                        model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        loss = model(x, y)
+                    losses.append(loss)
+                    train_loss += loss.detach()
+            with _LATENCY_PROFILER.section("train_backward"):
+                for loss in losses:
+                    (loss * grad_scale).backward()
+            with _LATENCY_PROFILER.section("optimizer_step"):
+                for opt in optimizers:
+                    opt.step()
+                zero_grad_all()
+            if profile_step < 3 or profile_step + 1 == args.profile_latency_steps:
+                log0(f"profile_step:{profile_step + 1}/{args.profile_latency_steps} train_loss:{(train_loss / grad_accum_steps).item():.4f}")
+        if distributed:
+            model.require_backward_grad_sync = True
+        log0(
+            f"profile_peak_memory allocated:{torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+            f"reserved:{torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+        )
+        for line in _LATENCY_PROFILER.summary_lines():
+            log0(line)
+        _LATENCY_PROFILER = None
+        if distributed:
+            dist.destroy_process_group()
+        return
 
     # -----------------------------
     # MAIN TRAINING LOOP
