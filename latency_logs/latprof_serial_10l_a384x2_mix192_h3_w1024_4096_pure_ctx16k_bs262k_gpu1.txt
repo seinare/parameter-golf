@@ -2194,3 +2194,121 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+====================================================================================================
+Running Python 3.12.9 | packaged by conda-forge | (main, Mar  4 2025, 22:48:41) [GCC 13.3.0]
+Running PyTorch 2.10.0+cu128
+Sun May 17 23:09:43 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.105.08             Driver Version: 580.105.08     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA L40                     Off |   00000000:01:00.0 Off |                  Off |
+| N/A   47C    P0            239W /  300W |   34978MiB /  49140MiB |     91%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA L40                     Off |   00000000:24:00.0 Off |                  Off |
+| N/A   23C    P0             39W /  300W |     435MiB /  49140MiB |      1%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA L40                     Off |   00000000:41:00.0 Off |                  Off |
+| N/A   22C    P8             27W /  300W |       3MiB /  49140MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA L40                     Off |   00000000:61:00.0 Off |                  Off |
+| N/A   21C    P8             27W /  300W |       3MiB /  49140MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA L40                     Off |   00000000:81:00.0 Off |                  Off |
+| N/A   28C    P0             76W /  300W |   45163MiB /  49140MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA L40                     Off |   00000000:A1:00.0 Off |                  Off |
+| N/A   26C    P0             73W /  300W |   45163MiB /  49140MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA L40                     Off |   00000000:C1:00.0 Off |                  Off |
+| N/A   29C    P0             76W /  300W |   45163MiB /  49140MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA L40                     Off |   00000000:E1:00.0 Off |                  Off |
+| N/A   30C    P0             77W /  300W |   45163MiB /  49140MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A         3622469      C   .venv/bin/python                        800MiB |
+|    0   N/A  N/A         3628175      C   ...ait-spectrum/.venv/bin/python      34164MiB |
+|    1   N/A  N/A         3708888      C   python3                                 426MiB |
+|    4   N/A  N/A         3523073      C   VLLM::Worker                          45154MiB |
+|    5   N/A  N/A         3523084      C   VLLM::Worker                          45154MiB |
+|    6   N/A  N/A         3523090      C   VLLM::Worker                          45154MiB |
+|    7   N/A  N/A         3523079      C   VLLM::Worker                          45154MiB |
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=/data1/xjh/code/parameter-golf/data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:42
+val_loader:shards pattern=/data1/xjh/code/parameter-golf/data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62013440
+model_params:27363132
+world_size:1 grad_accum_steps:8
+torch_compile:False grad_checkpoint_layers:False artery_parallel_streams:0 profile_latency:1 profile_latency_steps:30
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:3 num_kv_heads:3
+arterial_mixer:num_arteries:2 artery_dim:384 attn_windows:[1024, 4096] xsa_arteries:[] use_xformers:1 use_flash_attn:0 flex_block:64x64 flex_num_warps:4 mixer_dim:192 mixer_heads:3 mixer_layers:every mixer_every:1 mixer_start_layer:0 mixer_scale_init:1.0 artery_embed_init_std:0.0 mixer_unet_residual_kv:0 mixer_unet_residual_xsa_only:0 mixer_unet_residual_arteries:None mixer_unet_residual_sources:{} val_logit_merge:mean train_head_loss_weight:1.0
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 matrix_lr:0.04 scalar_lr:0.04
+train_batch_tokens:262144 train_seq_len:16384 iterations:20000 warmup_steps:10 max_wallclock_seconds:600.000
+seed:1337
+warmup_step:1/10
+warmup_step:2/10
+warmup_step:3/10
+warmup_step:4/10
+warmup_step:5/10
+warmup_step:6/10
+warmup_step:7/10
+warmup_step:8/10
+warmup_step:9/10
+warmup_step:10/10
+profile_step:1/30 train_loss:6.9313
+profile_step:2/30 train_loss:11.7042
+profile_step:3/30 train_loss:6.4198
+profile_step:30/30 train_loss:4.6298
+profile_peak_memory allocated:14668 MiB reserved:14786 MiB
+latency:artery0_block count:2400 total_ms:6583.982 avg_ms:2.743
+latency:artery1_block count:2400 total_ms:9051.729 avg_ms:3.772
+latency:artery_attn count:4800 total_ms:9123.298 avg_ms:1.901
+latency:artery_mlp count:4800 total_ms:5378.749 avg_ms:1.121
+latency:artery_slice count:4800 total_ms:8.850 avg_ms:0.002
+latency:artery_stack count:2400 total_ms:270.730 avg_ms:0.113
+latency:embedding_norm count:240 total_ms:29.559 avg_ms:0.123
+latency:embedding_view count:240 total_ms:1.152 avg_ms:0.005
+latency:final_norm count:240 total_ms:17.597 avg_ms:0.073
+latency:final_reshape count:240 total_ms:0.371 avg_ms:0.002
+latency:forward_hidden count:240 total_ms:19261.392 avg_ms:80.256
+latency:layer0 count:240 total_ms:1900.820 avg_ms:7.920
+latency:layer1 count:240 total_ms:1903.255 avg_ms:7.930
+latency:layer2 count:240 total_ms:1908.856 avg_ms:7.954
+latency:layer3 count:240 total_ms:1909.170 avg_ms:7.955
+latency:layer4 count:240 total_ms:2030.262 avg_ms:8.459
+latency:layer5 count:240 total_ms:1912.956 avg_ms:7.971
+latency:layer6 count:240 total_ms:1907.987 avg_ms:7.950
+latency:layer7 count:240 total_ms:1903.815 avg_ms:7.933
+latency:layer8 count:240 total_ms:1915.320 avg_ms:7.981
+latency:layer9 count:240 total_ms:1915.938 avg_ms:7.983
+latency:lm_heads count:240 total_ms:364.354 avg_ms:1.518
+latency:loss count:240 total_ms:309.611 avg_ms:1.290
+latency:mixer count:2400 total_ms:3264.740 avg_ms:1.360
+latency:mixer_out_layout count:2400 total_ms:64.103 avg_ms:0.027
+latency:mixer_qkv_reshape count:2400 total_ms:3.826 avg_ms:0.002
+latency:mixer_qkv_transpose count:2400 total_ms:3.888 avg_ms:0.002
+latency:optimizer_step count:30 total_ms:3205.078 avg_ms:106.836
+latency:train_backward count:240 total_ms:40650.975 avg_ms:169.379
+latency:train_forward count:240 total_ms:19939.599 avg_ms:83.082
+latency:data_cpu count:30 total_ms:112.611 avg_ms:3.754
