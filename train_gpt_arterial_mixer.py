@@ -1190,14 +1190,18 @@ class ArteryMixer(nn.Module):
             mixer_input = mixer_input + artery_embed.to(dtype=x.dtype)[None, None, :, :]
         source_input = mixer_input
         if residual_kv is not None:
-            source_input = torch.cat((mixer_input, residual_kv), dim=2)
+            with latency_section("mixer_cat"):
+                source_input = torch.cat((mixer_input, residual_kv), dim=2)
         source_count = source_input.size(2)
-        qkv = self.qkv(source_input).reshape(bsz, seqlen, source_count, 3, self.mixer_heads, self.head_dim)
+        qkv = self.qkv(source_input)
+        with latency_section("mixer_qkv_reshape"):
+            qkv = qkv.reshape(bsz, seqlen, source_count, 3, self.mixer_heads, self.head_dim)
         q_all, k, v = qkv.unbind(dim=3)
         q = q_all[:, :, :arteries, :, :]
-        q = q.transpose(2, 3)
-        k = k.transpose(2, 3)
-        v = v.transpose(2, 3)
+        with latency_section("mixer_qkv_transpose"):
+            q = q.transpose(2, 3)
+            k = k.transpose(2, 3)
+            v = v.transpose(2, 3)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         if self.mixer_slot_rope:
@@ -1212,7 +1216,8 @@ class ArteryMixer(nn.Module):
         scores = (q @ k.transpose(-1, -2)) * (self.head_dim ** -0.5)
         route = F.elu(scores)
         mixed = (route @ v) / max(source_count, 1)
-        mixed = mixed.transpose(2, 3).contiguous().reshape(bsz, seqlen, arteries, self.mixer_dim)
+        with latency_section("mixer_out_layout"):
+            mixed = mixed.transpose(2, 3).contiguous().reshape(bsz, seqlen, arteries, self.mixer_dim)
         mixed = self.proj(mixed)
         return x + self.mixer_scale.to(dtype=x.dtype) * mixed
 
@@ -1292,9 +1297,13 @@ class ArterialLayer(nn.Module):
     ) -> Tensor:
         artery_outputs = []
         for i, block in enumerate(self.arteries):
+            with latency_section("artery_slice"):
+                xi = x[:, :, i, :]
+                x0i = x0[:, :, i, :]
             with latency_section(f"artery{i}_block"):
-                artery_outputs.append(block(x[:, :, i, :], x0[:, :, i, :]))
-        x = torch.stack(artery_outputs, dim=2)
+                artery_outputs.append(block(xi, x0i))
+        with latency_section("artery_stack"):
+            x = torch.stack(artery_outputs, dim=2)
         if self.mixer is not None:
             with latency_section("mixer"):
                 return self.mixer(x, self.artery_embed, residual_kv)
@@ -1562,7 +1571,9 @@ class GPT(nn.Module):
     def forward_hidden(self, input_ids: Tensor) -> Tensor:
         bsz, seqlen = input_ids.shape
         with latency_section("embedding_norm"):
-            x = self.tok_emb(input_ids).view(bsz, seqlen, self.num_arteries, self.artery_dim)
+            x = self.tok_emb(input_ids)
+            with latency_section("embedding_view"):
+                x = x.view(bsz, seqlen, self.num_arteries, self.artery_dim)
             x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         layer_inputs: dict[int, Tensor] = {}
@@ -1570,7 +1581,9 @@ class GPT(nn.Module):
             with latency_section(f"layer{layer_idx}"):
                 x = self.forward_layer(layer_idx, x, x0, layer_inputs)
         with latency_section("final_norm"):
-            return self.final_norm(x).reshape(-1, self.num_arteries, self.artery_dim)
+            x = self.final_norm(x)
+            with latency_section("final_reshape"):
+                return x.reshape(-1, self.num_arteries, self.artery_dim)
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         bsz, seqlen = input_ids.shape
