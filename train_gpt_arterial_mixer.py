@@ -10,6 +10,7 @@ import copy
 import contextlib
 import glob
 import io
+import json
 import lzma
 import math
 import os
@@ -158,6 +159,7 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    skip_final_val = bool(int(os.environ.get("SKIP_FINAL_VAL", "0")))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
@@ -176,6 +178,17 @@ class Hyperparameters:
     profile_latency_steps = int(os.environ.get("PROFILE_LATENCY_STEPS", 20))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     post_train_quant = os.environ.get("POST_TRAIN_QUANT", "int8_zlib")
+    artery_split_step = int(os.environ.get("ARTERY_SPLIT_STEP", "-1"))
+    artery_split_factor = int(os.environ.get("ARTERY_SPLIT_FACTOR", "2"))
+    split_warmup_steps = int(os.environ.get("SPLIT_WARMUP_STEPS", os.environ.get("WARMUP_STEPS", "20")))
+    split_pre_ckpt_path = os.environ.get("SPLIT_PRE_CKPT_PATH", "split_pre_model.pt")
+    split_final_ckpt_path = os.environ.get("SPLIT_FINAL_CKPT_PATH", "split_final_model.pt")
+    val_downstream_every = int(os.environ.get("VAL_DOWNSTREAM_EVERY", "0"))
+    downstream_data_path = os.environ.get("DOWNSTREAM_DATA_PATH", "./data/downstream")
+    downstream_tasks = os.environ.get("DOWNSTREAM_TASKS", "mmlu,trivialqa,arc,piqa,hellaswag")
+    downstream_max_examples = int(os.environ.get("DOWNSTREAM_MAX_EXAMPLES", "32"))
+    downstream_fewshot = int(os.environ.get("DOWNSTREAM_FEWSHOT", "0"))
+    downstream_max_len = int(os.environ.get("DOWNSTREAM_MAX_LEN", "1024"))
     gptq_calib_seqs = int(os.environ.get("GPTQ_CALIB_SEQS", 64))
     gptq_calib_seq_len = int(os.environ.get("GPTQ_CALIB_SEQ_LEN", 2048))
     gptq_calib_batch_size = int(os.environ.get("GPTQ_CALIB_BATCH_SIZE", 8))
@@ -468,6 +481,169 @@ def eval_val(
     metrics["loss"] = metrics[f"{selected}_loss"]
     metrics["bpb"] = metrics[f"{selected}_bpb"]
     return metrics
+
+
+def downstream_task_file(data_path: str, task: str) -> Path | None:
+    root = Path(data_path)
+    candidates = [
+        root / f"{task}.jsonl",
+        root / f"{task}.json",
+        root / task / "val.jsonl",
+        root / task / "validation.jsonl",
+        root / task / "test.jsonl",
+        root / task / "dev.jsonl",
+    ]
+    aliases = {"triviaqa": ["trivialqa"], "trivialqa": ["triviaqa"]}
+    for alias in aliases.get(task, []):
+        candidates.extend((root / f"{alias}.jsonl", root / f"{alias}.json"))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def load_downstream_records(path: Path, limit: int) -> list[dict[str, object]]:
+    if path.suffix == ".jsonl":
+        records = []
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+                    if len(records) >= limit:
+                        break
+        return records
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(obj, dict):
+        obj = obj.get("validation") or obj.get("test") or obj.get("data") or obj.get("examples") or []
+    if not isinstance(obj, list):
+        return []
+    return [record for record in obj[:limit] if isinstance(record, dict)]
+
+
+def normalize_downstream_example(task: str, raw: dict[str, object]) -> dict[str, object] | None:
+    task = task.lower()
+    if task == "piqa":
+        choices = [str(raw.get("sol1", "")), str(raw.get("sol2", ""))]
+        return {"prompt": f"Question: {raw.get('goal', '')}\nAnswer:", "choices": choices, "answer": int(raw.get("label", 0))}
+    if task == "hellaswag":
+        choices = [str(x) for x in raw.get("endings", [])]
+        return {"prompt": str(raw.get("ctx") or raw.get("query") or ""), "choices": choices, "answer": int(raw.get("label", 0))}
+    if task == "arc":
+        choice_obj = raw.get("choices", {})
+        if isinstance(choice_obj, dict):
+            texts = [str(x) for x in choice_obj.get("text", [])]
+            labels = [str(x) for x in choice_obj.get("label", [])]
+        else:
+            texts = [str(x.get("text", x)) if isinstance(x, dict) else str(x) for x in choice_obj]
+            labels = [str(x.get("label", i)) if isinstance(x, dict) else str(i) for i, x in enumerate(choice_obj)]
+        answer_key = str(raw.get("answerKey", raw.get("answer", "0")))
+        answer = labels.index(answer_key) if answer_key in labels else int(answer_key) if answer_key.isdigit() else 0
+        return {"prompt": f"Question: {raw.get('question', '')}\nAnswer:", "choices": texts, "answer": answer}
+    if task == "mmlu":
+        choices = [str(x) for x in raw.get("choices", [])]
+        answer_raw = raw.get("answer", 0)
+        answer = int(answer_raw) if isinstance(answer_raw, (int, np.integer)) or str(answer_raw).isdigit() else "ABCD".find(str(answer_raw).upper())
+        return {"prompt": f"Question: {raw.get('question', '')}\nAnswer:", "choices": choices, "answer": max(answer, 0)}
+    if task in {"triviaqa", "trivialqa"}:
+        answers = raw.get("answers") or raw.get("answer") or raw.get("normalized_aliases") or []
+        if isinstance(answers, dict):
+            answers = answers.get("aliases") or answers.get("normalized_aliases") or answers.get("value") or []
+        if isinstance(answers, str):
+            answers = [answers]
+        answers = [str(answer) for answer in answers if str(answer)]
+        if not answers:
+            return None
+        return {"prompt": f"Question: {raw.get('question', '')}\nAnswer:", "answers": answers}
+    choices = raw.get("choices") or raw.get("endings")
+    if choices is not None:
+        choices = [str(x) for x in choices]
+        answer = int(raw.get("answer", raw.get("label", 0)))
+        return {"prompt": str(raw.get("question") or raw.get("ctx") or raw.get("prompt") or ""), "choices": choices, "answer": answer}
+    return None
+
+
+def continuation_logprob(
+    model: nn.Module,
+    sp: spm.SentencePieceProcessor,
+    prompt: str,
+    continuation: str,
+    device: torch.device,
+    max_len: int,
+) -> float:
+    prompt_ids = list(sp.encode(prompt, out_type=int))
+    continuation_ids = list(sp.encode(" " + continuation, out_type=int))
+    ids = (prompt_ids + continuation_ids)[-max_len:]
+    if len(ids) < 2 or not continuation_ids:
+        return float("-inf")
+    continuation_len = min(len(continuation_ids), len(ids) - 1)
+    x = torch.tensor(ids[:-1], dtype=torch.int64, device=device)[None, :]
+    y = torch.tensor(ids[1:], dtype=torch.int64, device=device)
+    start = max(y.numel() - continuation_len, 0)
+    eval_model = model.module if isinstance(model, DDP) else model
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+        logits = eval_model.forward_logits(x)[0].float()
+        log_probs = F.log_softmax(logits, dim=-1)
+    token_scores = log_probs[start:, :].gather(1, y[start:, None]).squeeze(1)
+    return float(token_scores.mean().item())
+
+
+def eval_downstream_short(
+    args: Hyperparameters,
+    model: nn.Module,
+    sp: spm.SentencePieceProcessor,
+    device: torch.device,
+) -> dict[str, float]:
+    model.eval()
+    results: dict[str, float] = {}
+    tasks = [task.strip().lower() for task in args.downstream_tasks.split(",") if task.strip()]
+    for task in tasks:
+        path = downstream_task_file(args.downstream_data_path, task)
+        if path is None:
+            results[f"{task}_missing"] = 1.0
+            continue
+        raw_records = load_downstream_records(path, args.downstream_max_examples + args.downstream_fewshot)
+        examples = [ex for record in raw_records if (ex := normalize_downstream_example(task, record)) is not None]
+        shots = examples[: args.downstream_fewshot]
+        eval_examples = examples[args.downstream_fewshot : args.downstream_fewshot + args.downstream_max_examples]
+        if not eval_examples:
+            results[f"{task}_missing"] = 1.0
+            continue
+        prefix = ""
+        for shot in shots:
+            if "choices" in shot:
+                answer_idx = int(shot["answer"])
+                prefix += f"{shot['prompt']} {shot['choices'][answer_idx]}\n\n"
+            elif "answers" in shot:
+                prefix += f"{shot['prompt']} {shot['answers'][0]}\n\n"
+        correct = 0
+        gold_scores = []
+        for ex in eval_examples:
+            prompt = prefix + str(ex["prompt"])
+            if "choices" in ex:
+                choices = list(ex["choices"])
+                if not choices:
+                    continue
+                scores = [
+                    continuation_logprob(model, sp, prompt, choice, device, args.downstream_max_len)
+                    for choice in choices
+                ]
+                pred = int(np.argmax(scores))
+                correct += int(pred == int(ex["answer"]))
+            else:
+                scores = [
+                    continuation_logprob(model, sp, prompt, answer, device, args.downstream_max_len)
+                    for answer in list(ex["answers"])
+                ]
+                gold_scores.append(max(scores))
+        if gold_scores:
+            results[f"{task}_gold_nll"] = -float(np.mean(gold_scores))
+            results[f"{task}_count"] = float(len(gold_scores))
+        else:
+            results[f"{task}_acc"] = correct / max(len(eval_examples), 1)
+            results[f"{task}_count"] = float(len(eval_examples))
+    model.train()
+    return results
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -2073,6 +2249,148 @@ class GPT(nn.Module):
         return geom_loss
 
 
+def make_gpt_from_args(args: Hyperparameters, device: torch.device) -> GPT:
+    model = GPT(
+        vocab_size=args.vocab_size,
+        num_layers=args.num_layers,
+        model_dim=args.model_dim,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        mlp_mult=args.mlp_mult,
+        tie_embeddings=args.tie_embeddings,
+        tied_embed_init_std=args.tied_embed_init_std,
+        logit_softcap=args.logit_softcap,
+        rope_base=args.rope_base,
+        qk_gain_init=args.qk_gain_init,
+        num_arteries=args.num_arteries,
+        mixer_dim=args.mixer_dim,
+        mixer_heads=args.mixer_heads,
+        mixer_layers=args.mixer_layers,
+        mixer_every=args.mixer_every,
+        mixer_start_layer=args.mixer_start_layer,
+        mixer_scale_init=args.mixer_scale_init,
+        artery_embed_init_std=args.artery_embed_init_std,
+        mixer_unet_residual_kv=args.mixer_unet_residual_kv,
+        mixer_unet_residual_xsa_only=args.mixer_unet_residual_xsa_only,
+        mixer_slot_rope=args.mixer_slot_rope,
+        mixer_slot_rope_base=args.mixer_slot_rope_base,
+        val_logit_merge=args.val_logit_merge,
+        train_head_loss_weight=args.train_head_loss_weight,
+        ortho_embed_scale=args.ortho_embed_scale,
+        attn_windows=args.attn_windows,
+        require_flash_attn=args.require_flash_attn,
+        use_xformers_local_attn=args.use_xformers_local_attn,
+        flex_block_m=args.flex_block_m,
+        flex_block_n=args.flex_block_n,
+        flex_num_warps=args.flex_num_warps,
+        xsa_arteries=args.xsa_arteries,
+        grad_checkpoint_layers=args.grad_checkpoint_layers,
+        artery_parallel_streams=args.artery_parallel_streams,
+        artery_grouped_layout=args.artery_grouped_layout,
+        grouped_linear_mode=args.grouped_linear_mode,
+    ).to(device).bfloat16()
+    for module in model.modules():
+        if isinstance(module, (CastedLinear, GroupedLinear)):
+            module.float()
+    restore_low_dim_params_to_fp32(model)
+    return model
+
+
+def build_optimizers(base_model: GPT, args: Hyperparameters) -> tuple[list[torch.optim.Optimizer], Muon, float]:
+    block_named_params = list(base_model.blocks.named_parameters())
+    matrix_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim >= 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    scalar_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    if base_model.skip_weights.numel() > 0:
+        scalar_params.append(base_model.skip_weights)
+    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    optimizer_tok = torch.optim.Adam(
+        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+    optimizer_muon = Muon(
+        matrix_params,
+        lr=args.matrix_lr,
+        momentum=args.muon_momentum,
+        backend_steps=args.muon_backend_steps,
+        bucketed=args.muon_bucketed,
+    )
+    for group in optimizer_muon.param_groups:
+        group["base_lr"] = args.matrix_lr
+    optimizer_scalar = torch.optim.Adam(
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if base_model.lm_head is not None:
+        optimizer_head = torch.optim.Adam(
+            [{"params": list(base_model.lm_head.parameters()), "lr": args.head_lr, "base_lr": args.head_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.insert(1, optimizer_head)
+    return optimizers, optimizer_muon, token_lr
+
+
+def repeat_csv_ints(value: str, factor: int) -> str:
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    return ",".join(parts * factor)
+
+
+def repeat_xsa_indices(value: str, old_count: int, factor: int) -> str:
+    indices = [int(part) for part in value.split(",") if part.strip()]
+    expanded = [index + offset * old_count for offset in range(factor) for index in indices]
+    return ",".join(str(index) for index in expanded)
+
+
+def split_artery_model(old_model: GPT, args: Hyperparameters, device: torch.device) -> GPT:
+    if args.artery_grouped_layout:
+        raise ValueError("ARTERY_SPLIT_STEP currently supports serial arterial modules only")
+    if args.artery_split_factor != 2:
+        raise ValueError("ARTERY_SPLIT_FACTOR currently supports only 2")
+    old_count = old_model.num_arteries
+    new_count = old_count * args.artery_split_factor
+    old_model_dim = args.model_dim
+    args.num_arteries = new_count
+    args.model_dim = old_model_dim * args.artery_split_factor
+    args.attn_windows = repeat_csv_ints(args.attn_windows, args.artery_split_factor)
+    args.xsa_arteries = repeat_xsa_indices(args.xsa_arteries, old_count, args.artery_split_factor)
+    new_model = make_gpt_from_args(args, device)
+    with torch.no_grad():
+        old_emb = old_model.tok_emb.weight.view(old_model.tok_emb.num_embeddings, old_count, old_model.artery_dim)
+        new_emb = new_model.tok_emb.weight.view(new_model.tok_emb.num_embeddings, new_count, new_model.artery_dim)
+        new_emb[:, :old_count, :].copy_(old_emb)
+        for layer_idx, (old_layer, new_layer) in enumerate(zip(old_model.blocks, new_model.blocks, strict=True)):
+            if not isinstance(old_layer, ArterialLayer) or not isinstance(new_layer, ArterialLayer):
+                raise ValueError("ARTERY_SPLIT_STEP requires ArterialLayer blocks")
+            for new_idx in range(new_count):
+                source_idx = new_idx % old_count
+                new_layer.arteries[new_idx].load_state_dict(old_layer.arteries[source_idx].state_dict(), strict=True)
+            if old_layer.mixer is not None and new_layer.mixer is not None:
+                new_layer.mixer.load_state_dict(old_layer.mixer.state_dict(), strict=True)
+            if old_layer.artery_embed is not None and new_layer.artery_embed is not None:
+                new_layer.artery_embed[:old_count].copy_(old_layer.artery_embed)
+            if old_layer.mixer is None and new_layer.mixer is not None:
+                # A single-artery model gains its first mixer at split time; keep the clean zero-proj init.
+                pass
+        if old_model.lm_head is not None and new_model.lm_head is not None:
+            for new_idx, head in enumerate(new_model.lm_head):
+                head.load_state_dict(old_model.lm_head[new_idx % old_count].state_dict(), strict=True)
+    return new_model
+
+
 # -----------------------------
 # TRAINING
 # -----------------------------
@@ -2174,49 +2492,7 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
-    base_model = GPT(
-        vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
-        model_dim=args.model_dim,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings,
-        tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap,
-        rope_base=args.rope_base,
-        qk_gain_init=args.qk_gain_init,
-        num_arteries=args.num_arteries,
-        mixer_dim=args.mixer_dim,
-        mixer_heads=args.mixer_heads,
-        mixer_layers=args.mixer_layers,
-        mixer_every=args.mixer_every,
-        mixer_start_layer=args.mixer_start_layer,
-        mixer_scale_init=args.mixer_scale_init,
-        artery_embed_init_std=args.artery_embed_init_std,
-        mixer_unet_residual_kv=args.mixer_unet_residual_kv,
-        mixer_unet_residual_xsa_only=args.mixer_unet_residual_xsa_only,
-        mixer_slot_rope=args.mixer_slot_rope,
-        mixer_slot_rope_base=args.mixer_slot_rope_base,
-        val_logit_merge=args.val_logit_merge,
-        train_head_loss_weight=args.train_head_loss_weight,
-        ortho_embed_scale=args.ortho_embed_scale,
-        attn_windows=args.attn_windows,
-        require_flash_attn=args.require_flash_attn,
-        use_xformers_local_attn=args.use_xformers_local_attn,
-        flex_block_m=args.flex_block_m,
-        flex_block_n=args.flex_block_n,
-        flex_num_warps=args.flex_num_warps,
-        xsa_arteries=args.xsa_arteries,
-        grad_checkpoint_layers=args.grad_checkpoint_layers,
-        artery_parallel_streams=args.artery_parallel_streams,
-        artery_grouped_layout=args.artery_grouped_layout,
-        grouped_linear_mode=args.grouped_linear_mode,
-    ).to(device).bfloat16()
-    for module in base_model.modules():
-        if isinstance(module, (CastedLinear, GroupedLinear)):
-            module.float()
-    restore_low_dim_params_to_fp32(base_model)
+    base_model = make_gpt_from_args(args, device)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if args.torch_compile else base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -2225,50 +2501,7 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
-    matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim >= 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
-    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-    optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
-        bucketed=args.muon_bucketed,
-    )
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
-            [{"params": list(base_model.lm_head.parameters()), "lr": args.head_lr, "base_lr": args.head_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.insert(1, optimizer_head)
+    optimizers, optimizer_muon, token_lr = build_optimizers(base_model, args)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -2310,6 +2543,16 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(
+        f"artery_split_step:{args.artery_split_step} artery_split_factor:{args.artery_split_factor} "
+        f"split_warmup_steps:{args.split_warmup_steps} split_pre_ckpt_path:{args.split_pre_ckpt_path} "
+        f"split_final_ckpt_path:{args.split_final_ckpt_path}"
+    )
+    log0(
+        f"val_downstream_every:{args.val_downstream_every} downstream_tasks:{args.downstream_tasks} "
+        f"downstream_data_path:{args.downstream_data_path} downstream_max_examples:{args.downstream_max_examples} "
+        f"downstream_fewshot:{args.downstream_fewshot}"
+    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -2335,13 +2578,16 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
-    # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
-    # initial weights/optimizer state so measured training starts from the true init.
-    if args.warmup_steps > 0:
+    def run_compile_warmup(num_steps: int, label: str) -> None:
+        nonlocal train_loader
+        if num_steps <= 0:
+            return
+        # Warmup primes the compiled forward/backward/optimizer paths, then restores the
+        # current weights/optimizer state so measured training resumes from the same point.
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
-        for warmup_step in range(args.warmup_steps):
+        for warmup_step in range(num_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
@@ -2353,8 +2599,8 @@ def main() -> None:
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
-            if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+            if num_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == num_steps:
+                log0(f"{label}_warmup_step:{warmup_step + 1}/{num_steps}")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -2362,6 +2608,8 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    run_compile_warmup(args.warmup_steps, "base")
 
     if args.profile_latency:
         _LATENCY_PROFILER = LatencyProfiler()
@@ -2409,14 +2657,62 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    split_done = False
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
     step = 0
     while True:
+        if args.artery_split_step >= 0 and not split_done and step >= args.artery_split_step:
+            torch.cuda.synchronize()
+            training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            if master_process:
+                torch.save(
+                    {
+                        "step": step,
+                        "model_state": base_model.state_dict(),
+                        "num_arteries": base_model.num_arteries,
+                        "model_dim": args.model_dim,
+                        "attn_windows": args.attn_windows,
+                        "xsa_arteries": args.xsa_arteries,
+                    },
+                    args.split_pre_ckpt_path,
+                )
+                log0(
+                    f"artery_split:pre_checkpoint path:{args.split_pre_ckpt_path} "
+                    f"step:{step} num_arteries:{base_model.num_arteries} model_dim:{args.model_dim}"
+                )
+            if distributed:
+                dist.barrier()
+            if args.torch_compile:
+                # Drop compiled wrappers before replacing the module graph.
+                del model
+                del compiled_model
+                torch.cuda.empty_cache()
+            old_model = base_model
+            base_model = split_artery_model(old_model, args, device)
+            del old_model
+            compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if args.torch_compile else base_model
+            model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+            optimizers, optimizer_muon, token_lr = build_optimizers(base_model, args)
+            split_done = True
+            log0(
+                f"artery_split:complete step:{step} num_arteries:{base_model.num_arteries} "
+                f"model_dim:{args.model_dim} model_params:{sum(p.numel() for p in base_model.parameters())} "
+                f"attn_windows:{args.attn_windows} xsa_arteries:{args.xsa_arteries}"
+            )
+            run_compile_warmup(args.split_warmup_steps, "split")
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        should_validate = (last_step and not args.skip_final_val) or (
+            args.val_loss_every > 0 and step % args.val_loss_every == 0
+        )
+        should_downstream = args.val_downstream_every > 0 and (
+            (last_step and not args.skip_final_val) or step % args.val_downstream_every == 0
+        )
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
@@ -2438,6 +2734,21 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"{val_detail} train_time:{training_time_ms:.0f}ms "
                 f"step_avg:{training_time_ms / max(step, 1):.2f}ms"
+            )
+            if should_downstream:
+                downstream_metrics = eval_downstream_short(args, model, sp, device)
+                downstream_detail = " ".join(f"downstream_{name}:{value:.4f}" for name, value in downstream_metrics.items())
+                log0(f"step:{step}/{args.iterations} val_downstream {downstream_detail}")
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+        elif should_downstream:
+            torch.cuda.synchronize()
+            training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            downstream_metrics = eval_downstream_short(args, model, sp, device)
+            downstream_detail = " ".join(f"downstream_{name}:{value:.4f}" for name, value in downstream_metrics.items())
+            log0(
+                f"step:{step}/{args.iterations} val_downstream {downstream_detail} "
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -2504,6 +2815,24 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if split_done and master_process:
+        torch.save(
+            {
+                "step": step,
+                "model_state": base_model.state_dict(),
+                "num_arteries": base_model.num_arteries,
+                "model_dim": args.model_dim,
+                "attn_windows": args.attn_windows,
+                "xsa_arteries": args.xsa_arteries,
+            },
+            args.split_final_ckpt_path,
+        )
+        log0(
+            f"artery_split:final_checkpoint path:{args.split_final_ckpt_path} "
+            f"step:{step} num_arteries:{base_model.num_arteries} model_dim:{args.model_dim}"
+        )
+    if distributed:
+        dist.barrier()
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -2518,6 +2847,12 @@ def main() -> None:
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+
+    if args.post_train_quant == "none":
+        log0("post_train_quant:none skipping compressed export and roundtrip validation")
+        if distributed:
+            dist.destroy_process_group()
+        return
 
     export_sd = base_model.state_dict()
     quant_label = "int8_zlib"
