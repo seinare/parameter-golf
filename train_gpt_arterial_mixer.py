@@ -56,6 +56,11 @@ except ImportError:  # Preferred path for efficient long-context sliding-window 
     xops = None
     LocalAttentionFromBottomRightMask = None
 
+try:
+    import wandb
+except ImportError:  # wandb is optional for local smoke tests.
+    wandb = None
+
 
 class LatencyProfiler:
     def __init__(self) -> None:
@@ -159,6 +164,7 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    val_loss_every_tokens = int(os.environ.get("VAL_LOSS_EVERY_TOKENS", "0"))
     skip_final_val = bool(int(os.environ.get("SKIP_FINAL_VAL", "0")))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
@@ -179,16 +185,27 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     post_train_quant = os.environ.get("POST_TRAIN_QUANT", "int8_zlib")
     artery_split_step = int(os.environ.get("ARTERY_SPLIT_STEP", "-1"))
+    artery_split_token_milestones = os.environ.get("ARTERY_SPLIT_TOKEN_MILESTONES", "")
+    final_train_tokens = int(os.environ.get("FINAL_TRAIN_TOKENS", "0"))
     artery_split_factor = int(os.environ.get("ARTERY_SPLIT_FACTOR", "2"))
     split_warmup_steps = int(os.environ.get("SPLIT_WARMUP_STEPS", os.environ.get("WARMUP_STEPS", "20")))
+    split_warmup_fraction = float(os.environ.get("SPLIT_WARMUP_FRACTION", "0.05"))
+    split_warmdown_fraction = float(os.environ.get("SPLIT_WARMDOWN_FRACTION", "0.25"))
     split_pre_ckpt_path = os.environ.get("SPLIT_PRE_CKPT_PATH", "split_pre_model.pt")
     split_final_ckpt_path = os.environ.get("SPLIT_FINAL_CKPT_PATH", "split_final_model.pt")
+    split_checkpoint_dir = os.environ.get("SPLIT_CHECKPOINT_DIR", "split_checkpoints")
     val_downstream_every = int(os.environ.get("VAL_DOWNSTREAM_EVERY", "0"))
+    val_downstream_every_tokens = int(os.environ.get("VAL_DOWNSTREAM_EVERY_TOKENS", "0"))
     downstream_data_path = os.environ.get("DOWNSTREAM_DATA_PATH", "./data/downstream")
     downstream_tasks = os.environ.get("DOWNSTREAM_TASKS", "mmlu,trivialqa,arc,piqa,hellaswag")
     downstream_max_examples = int(os.environ.get("DOWNSTREAM_MAX_EXAMPLES", "32"))
     downstream_fewshot = int(os.environ.get("DOWNSTREAM_FEWSHOT", "0"))
     downstream_max_len = int(os.environ.get("DOWNSTREAM_MAX_LEN", "1024"))
+
+    # W&B logging is on by default when wandb is installed; set WANDB_MODE=disabled for local smoke tests.
+    wandb_project = os.environ.get("WANDB_PROJECT", "parameter-golf-arterial-mixer")
+    wandb_entity = os.environ.get("WANDB_ENTITY", "")
+    wandb_mode = os.environ.get("WANDB_MODE", "online")
     gptq_calib_seqs = int(os.environ.get("GPTQ_CALIB_SEQS", 64))
     gptq_calib_seq_len = int(os.environ.get("GPTQ_CALIB_SEQ_LEN", 2048))
     gptq_calib_batch_size = int(os.environ.get("GPTQ_CALIB_BATCH_SIZE", 8))
@@ -2355,6 +2372,22 @@ def repeat_xsa_indices(value: str, old_count: int, factor: int) -> str:
     return ",".join(str(index) for index in expanded)
 
 
+def parse_token_milestones(value: str) -> list[int]:
+    milestones = [int(float(part.strip())) for part in value.split(",") if part.strip()]
+    return sorted(milestones)
+
+
+def token_count_to_steps(token_count: int, batch_tokens: int) -> int:
+    if token_count <= 0:
+        return 0
+    return max(math.ceil(token_count / max(batch_tokens, 1)), 1)
+
+
+def split_checkpoint_path(args: Hyperparameters, label: str, trained_tokens: int, num_arteries: int) -> str:
+    safe_label = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in label)
+    return str(Path(args.split_checkpoint_dir) / f"{safe_label}_tok{trained_tokens}_a{num_arteries}.pt")
+
+
 def split_artery_model(old_model: GPT, args: Hyperparameters, device: torch.device) -> GPT:
     if args.artery_grouped_layout:
         raise ValueError("ARTERY_SPLIT_STEP currently supports serial arterial modules only")
@@ -2504,6 +2537,22 @@ def main() -> None:
     optimizers, optimizer_muon, token_lr = build_optimizers(base_model, args)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    wandb_run = None
+    if master_process and wandb is not None and args.wandb_mode != "disabled":
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity or None,
+            name=args.run_id,
+            id=args.run_id,
+            resume="allow",
+            mode=args.wandb_mode,
+            config={
+                name: value
+                for name, value in vars(args.__class__).items()
+                if not name.startswith("_") and isinstance(value, (int, float, str, bool))
+            },
+        )
+        wandb.config.update({"model_params": n_params}, allow_val_change=True)
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(
@@ -2545,8 +2594,11 @@ def main() -> None:
     )
     log0(
         f"artery_split_step:{args.artery_split_step} artery_split_factor:{args.artery_split_factor} "
-        f"split_warmup_steps:{args.split_warmup_steps} split_pre_ckpt_path:{args.split_pre_ckpt_path} "
-        f"split_final_ckpt_path:{args.split_final_ckpt_path}"
+        f"split_token_milestones:{args.artery_split_token_milestones or 'none'} "
+        f"final_train_tokens:{args.final_train_tokens} split_warmup_steps:{args.split_warmup_steps} "
+        f"split_warmup_fraction:{args.split_warmup_fraction} split_warmdown_fraction:{args.split_warmdown_fraction} "
+        f"split_pre_ckpt_path:{args.split_pre_ckpt_path} split_final_ckpt_path:{args.split_final_ckpt_path} "
+        f"split_checkpoint_dir:{args.split_checkpoint_dir}"
     )
     log0(
         f"val_downstream_every:{args.val_downstream_every} downstream_tasks:{args.downstream_tasks} "
@@ -2658,61 +2710,201 @@ def main() -> None:
     training_time_ms = 0.0
     stop_after_step: int | None = None
     split_done = False
+    split_token_milestones = parse_token_milestones(args.artery_split_token_milestones)
+    token_schedule_active = bool(split_token_milestones or args.final_train_tokens > 0)
+    split_index = 0
+    schedule_tokens = 0
+    phase = "train"
+    phase_end_step: int | None = None
+    phase_start_step = 0
+    phase_total_steps = 0
+    phase_target_tokens = 0
+    final_warmdown_complete = False
+    split_lr_warmup_start_step: int | None = None
+    split_lr_warmup_steps = 0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
+    if token_schedule_active and master_process:
+        os.makedirs(args.split_checkpoint_dir, exist_ok=True)
+
+    def save_split_checkpoint(path: str, label: str, checkpoint_step: int, trained_tokens: int) -> None:
+        if not master_process:
+            return
+        torch.save(
+            {
+                "step": checkpoint_step,
+                "trained_tokens": trained_tokens,
+                "phase": label,
+                "model_state": base_model.state_dict(),
+                "num_arteries": base_model.num_arteries,
+                "model_dim": args.model_dim,
+                "attn_windows": args.attn_windows,
+                "xsa_arteries": args.xsa_arteries,
+            },
+            path,
+        )
+        log0(
+            f"artery_split:{label}_checkpoint path:{path} step:{checkpoint_step} "
+            f"trained_tokens:{trained_tokens} num_arteries:{base_model.num_arteries} model_dim:{args.model_dim}"
+        )
+        if wandb_run is not None:
+            wandb.log(
+                {
+                    f"split/{label}_checkpoint": 1,
+                    "split/num_arteries": base_model.num_arteries,
+                    "split/model_dim": args.model_dim,
+                    "tokens/schedule": trained_tokens,
+                },
+                step=checkpoint_step,
+            )
+
+    def rebuild_after_split(split_step: int, trained_tokens: int) -> None:
+        nonlocal base_model, compiled_model, model, optimizers, optimizer_muon, token_lr
+        if distributed:
+            dist.barrier()
+        if args.torch_compile:
+            del model
+            del compiled_model
+            torch.cuda.empty_cache()
+        old_model = base_model
+        base_model = split_artery_model(old_model, args, device)
+        del old_model
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if args.torch_compile else base_model
+        model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+        optimizers, optimizer_muon, token_lr = build_optimizers(base_model, args)
+        log0(
+            f"artery_split:complete step:{split_step} trained_tokens:{trained_tokens} "
+            f"num_arteries:{base_model.num_arteries} model_dim:{args.model_dim} "
+            f"model_params:{sum(p.numel() for p in base_model.parameters())} "
+            f"attn_windows:{args.attn_windows} xsa_arteries:{args.xsa_arteries}"
+        )
+        if wandb_run is not None:
+            wandb.config.update(
+                {
+                    "model_params": sum(p.numel() for p in base_model.parameters()),
+                    "num_arteries": base_model.num_arteries,
+                    "model_dim": args.model_dim,
+                },
+                allow_val_change=True,
+            )
+            wandb.log(
+                {
+                    "split/complete": 1,
+                    "split/num_arteries": base_model.num_arteries,
+                    "split/model_dim": args.model_dim,
+                    "tokens/schedule": trained_tokens,
+                },
+                step=split_step,
+            )
+        run_compile_warmup(args.split_warmup_steps, "split")
+
     step = 0
     while True:
-        if args.artery_split_step >= 0 and not split_done and step >= args.artery_split_step:
+        if (
+            token_schedule_active
+            and phase == "train"
+            and split_index < len(split_token_milestones)
+            and schedule_tokens >= split_token_milestones[split_index]
+        ):
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            if master_process:
-                torch.save(
-                    {
-                        "step": step,
-                        "model_state": base_model.state_dict(),
-                        "num_arteries": base_model.num_arteries,
-                        "model_dim": args.model_dim,
-                        "attn_windows": args.attn_windows,
-                        "xsa_arteries": args.xsa_arteries,
-                    },
-                    args.split_pre_ckpt_path,
-                )
-                log0(
-                    f"artery_split:pre_checkpoint path:{args.split_pre_ckpt_path} "
-                    f"step:{step} num_arteries:{base_model.num_arteries} model_dim:{args.model_dim}"
-                )
-            if distributed:
-                dist.barrier()
-            if args.torch_compile:
-                # Drop compiled wrappers before replacing the module graph.
-                del model
-                del compiled_model
-                torch.cuda.empty_cache()
-            old_model = base_model
-            base_model = split_artery_model(old_model, args, device)
-            del old_model
-            compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if args.torch_compile else base_model
-            model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
-            optimizers, optimizer_muon, token_lr = build_optimizers(base_model, args)
-            split_done = True
+            phase_target_tokens = split_token_milestones[split_index]
+            pre_path = split_checkpoint_path(args, "pre_split", phase_target_tokens, base_model.num_arteries)
+            save_split_checkpoint(pre_path, "pre_split", step, phase_target_tokens)
+            phase = "pre_split_warmdown"
+            phase_start_step = step
+            phase_total_steps = token_count_to_steps(int(phase_target_tokens * args.split_warmdown_fraction), args.train_batch_tokens)
+            phase_end_step = step + phase_total_steps
             log0(
-                f"artery_split:complete step:{step} num_arteries:{base_model.num_arteries} "
-                f"model_dim:{args.model_dim} model_params:{sum(p.numel() for p in base_model.parameters())} "
-                f"attn_windows:{args.attn_windows} xsa_arteries:{args.xsa_arteries}"
+                f"artery_split:warmdown_start step:{step} trained_tokens:{phase_target_tokens} "
+                f"warmdown_steps:{phase_total_steps} warmdown_tokens:{phase_total_steps * args.train_batch_tokens}"
             )
-            run_compile_warmup(args.split_warmup_steps, "split")
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
-        last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
+        if (
+            token_schedule_active
+            and phase == "train"
+            and split_index >= len(split_token_milestones)
+            and args.final_train_tokens > 0
+            and schedule_tokens >= args.final_train_tokens
+            and not final_warmdown_complete
+        ):
+            torch.cuda.synchronize()
+            training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            phase_target_tokens = args.final_train_tokens
+            pre_path = split_checkpoint_path(args, "pre_final_warmdown", phase_target_tokens, base_model.num_arteries)
+            save_split_checkpoint(pre_path, "pre_final_warmdown", step, phase_target_tokens)
+            phase = "final_warmdown"
+            phase_start_step = step
+            phase_total_steps = token_count_to_steps(int(phase_target_tokens * args.split_warmdown_fraction), args.train_batch_tokens)
+            phase_end_step = step + phase_total_steps
+            log0(
+                f"artery_split:final_warmdown_start step:{step} trained_tokens:{phase_target_tokens} "
+                f"warmdown_steps:{phase_total_steps} warmdown_tokens:{phase_total_steps * args.train_batch_tokens}"
+            )
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
 
-        should_validate = (last_step and not args.skip_final_val) or (
-            args.val_loss_every > 0 and step % args.val_loss_every == 0
+        if token_schedule_active and phase in {"pre_split_warmdown", "final_warmdown"} and phase_end_step is not None and step >= phase_end_step:
+            torch.cuda.synchronize()
+            training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            label = "after_anneal" if phase == "pre_split_warmdown" else "final_after_anneal"
+            anneal_path = split_checkpoint_path(args, label, phase_target_tokens, base_model.num_arteries)
+            save_split_checkpoint(anneal_path, label, step, phase_target_tokens)
+            if phase == "final_warmdown":
+                final_warmdown_complete = True
+                stop_after_step = step
+            else:
+                rebuild_after_split(step, phase_target_tokens)
+                split_index += 1
+                split_lr_warmup_start_step = step
+                split_lr_warmup_steps = token_count_to_steps(
+                    int(phase_target_tokens * args.split_warmup_fraction), args.train_batch_tokens
+                )
+                log0(
+                    f"artery_split:train_warmup_start step:{step} trained_tokens:{phase_target_tokens} "
+                    f"warmup_steps:{split_lr_warmup_steps} warmup_tokens:{split_lr_warmup_steps * args.train_batch_tokens}"
+                )
+                phase = "train"
+                phase_end_step = None
+                phase_total_steps = 0
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+        if not token_schedule_active and args.artery_split_step >= 0 and not split_done and step >= args.artery_split_step:
+            torch.cuda.synchronize()
+            training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            save_split_checkpoint(args.split_pre_ckpt_path, "pre", step, schedule_tokens)
+            rebuild_after_split(step, schedule_tokens)
+            split_done = True
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+        last_step = (
+            (not token_schedule_active and step == args.iterations)
+            or (stop_after_step is not None and step >= stop_after_step)
         )
-        should_downstream = args.val_downstream_every > 0 and (
+
+        should_validate_by_step = args.val_loss_every > 0 and step % args.val_loss_every == 0
+        should_validate_by_tokens = (
+            args.val_loss_every_tokens > 0
+            and schedule_tokens > 0
+            and schedule_tokens % args.val_loss_every_tokens < args.train_batch_tokens
+            and phase == "train"
+        )
+        should_validate = (last_step and not args.skip_final_val) or should_validate_by_step or should_validate_by_tokens
+        should_downstream_by_step = args.val_downstream_every > 0 and (
             (last_step and not args.skip_final_val) or step % args.val_downstream_every == 0
         )
+        should_downstream_by_tokens = (
+            args.val_downstream_every_tokens > 0
+            and schedule_tokens > 0
+            and schedule_tokens % args.val_downstream_every_tokens < args.train_batch_tokens
+            and phase == "train"
+        )
+        should_downstream = should_downstream_by_step or should_downstream_by_tokens
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
@@ -2735,10 +2927,29 @@ def main() -> None:
                 f"{val_detail} train_time:{training_time_ms:.0f}ms "
                 f"step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if wandb_run is not None:
+                wandb.log(
+                    {
+                        "val/loss": val_loss,
+                        "val/bpb": val_bpb,
+                        **{f"val/{name}": value for name, value in val_metrics.items()},
+                        "tokens/schedule": schedule_tokens,
+                        "tokens/consumed": step * args.train_batch_tokens,
+                        "split/num_arteries": base_model.num_arteries,
+                        "split/model_dim": args.model_dim,
+                        "time/train_ms": training_time_ms,
+                    },
+                    step=step,
+                )
             if should_downstream:
                 downstream_metrics = eval_downstream_short(args, model, sp, device)
                 downstream_detail = " ".join(f"downstream_{name}:{value:.4f}" for name, value in downstream_metrics.items())
                 log0(f"step:{step}/{args.iterations} val_downstream {downstream_detail}")
+                if wandb_run is not None:
+                    wandb.log(
+                        {f"downstream/{name}": value for name, value in downstream_metrics.items()},
+                        step=step,
+                    )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
         elif should_downstream:
@@ -2750,19 +2961,40 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_downstream {downstream_detail} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if wandb_run is not None:
+                wandb.log(
+                    {
+                        **{f"downstream/{name}": value for name, value in downstream_metrics.items()},
+                        "tokens/schedule": schedule_tokens,
+                        "tokens/consumed": step * args.train_batch_tokens,
+                        "time/train_ms": training_time_ms,
+                    },
+                    step=step,
+                )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
         if last_step:
             if stop_after_step is not None and step < args.iterations:
+                stop_reason = "token_schedule_complete" if final_warmdown_complete else "wallclock_cap"
                 log0(
-                    f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
-                    f"step:{step}/{args.iterations}"
+                    f"stopping_early:{stop_reason} train_time:{training_time_ms:.0f}ms "
+                    f"step:{step}/{args.iterations} schedule_tokens:{schedule_tokens}"
                 )
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        if phase in {"pre_split_warmdown", "final_warmdown"} and phase_total_steps > 0:
+            warmdown_progress = step - phase_start_step
+            scale *= max((phase_total_steps - warmdown_progress) / phase_total_steps, 0.0)
+        if (
+            phase == "train"
+            and split_lr_warmup_start_step is not None
+            and split_lr_warmup_steps > 0
+            and step < split_lr_warmup_start_step + split_lr_warmup_steps
+        ):
+            scale *= min(max((step - split_lr_warmup_start_step + 1) / split_lr_warmup_steps, 0.0), 1.0)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -2791,6 +3023,8 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+        if phase == "train":
+            schedule_tokens += args.train_batch_tokens
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -2799,8 +3033,25 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"phase:{phase} schedule_tokens:{schedule_tokens} lr_mul:{scale:.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if wandb_run is not None:
+                wandb.log(
+                    {
+                        "train/loss": train_loss.item(),
+                        "train/lr_mul": scale,
+                        "train/muon_momentum": muon_momentum,
+                        "train/phase_code": {"train": 0, "pre_split_warmdown": 1, "final_warmdown": 2}.get(phase, -1),
+                        "tokens/schedule": schedule_tokens,
+                        "tokens/consumed": step * args.train_batch_tokens,
+                        "split/num_arteries": base_model.num_arteries,
+                        "split/model_dim": args.model_dim,
+                        "time/train_ms": approx_training_time_ms,
+                        "time/step_avg_ms": approx_training_time_ms / step,
+                    },
+                    step=step,
+                )
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -2815,6 +3066,16 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if wandb_run is not None:
+        wandb.log(
+            {
+                "memory/allocated_mib": torch.cuda.max_memory_allocated() // 1024 // 1024,
+                "memory/reserved_mib": torch.cuda.max_memory_reserved() // 1024 // 1024,
+                "tokens/schedule": schedule_tokens,
+                "tokens/consumed": step * args.train_batch_tokens,
+            },
+            step=step,
+        )
     if split_done and master_process:
         torch.save(
             {
@@ -2850,6 +3111,8 @@ def main() -> None:
 
     if args.post_train_quant == "none":
         log0("post_train_quant:none skipping compressed export and roundtrip validation")
+        if wandb_run is not None:
+            wandb.finish()
         if distributed:
             dist.destroy_process_group()
         return
@@ -2956,6 +3219,16 @@ def main() -> None:
     )
     log0(f"final_{quant_label}_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
     log0(f"final_{quant_label}_roundtrip_all {q_val_detail}")
+    if wandb_run is not None:
+        wandb.log(
+            {
+                "final/roundtrip_val_loss": q_val_loss,
+                "final/roundtrip_val_bpb": q_val_bpb,
+                **{f"final/roundtrip_{name}": value for name, value in q_val_metrics.items()},
+            },
+            step=step,
+        )
+        wandb.finish()
 
     if distributed:
         dist.destroy_process_group()
