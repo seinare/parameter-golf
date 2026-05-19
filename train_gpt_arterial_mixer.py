@@ -1667,7 +1667,7 @@ class Block(nn.Module):
 
 
 class ArteryMixer(nn.Module):
-    # Mixes arteries independently at each token position using unnormalized elu routing.
+    # Mixes arteries independently at each token position using standard MHA over artery/source slots.
     def __init__(
         self,
         num_arteries: int,
@@ -1719,8 +1719,6 @@ class ArteryMixer(nn.Module):
             q = q.transpose(2, 3)
             k = k.transpose(2, 3)
             v = v.transpose(2, 3)
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
         if self.mixer_slot_rope:
             slot_positions = torch.zeros((source_count,), dtype=torch.long, device=x.device)
             if residual_kv is not None:
@@ -1730,9 +1728,11 @@ class ArteryMixer(nn.Module):
             q_positions = torch.zeros((arteries,), dtype=torch.long, device=x.device)
             q = apply_rotary_emb_positions(q, cos, sin, q_positions)
             k = apply_rotary_emb_positions(k, cos, sin, slot_positions)
-        scores = (q @ k.transpose(-1, -2)) * (self.head_dim ** -0.5)
-        route = F.elu(scores)
-        mixed = (route @ v) / max(source_count, 1)
+        q = q.reshape(bsz * seqlen, self.mixer_heads, arteries, self.head_dim)
+        k = k.reshape(bsz * seqlen, self.mixer_heads, source_count, self.head_dim)
+        v = v.reshape(bsz * seqlen, self.mixer_heads, source_count, self.head_dim)
+        mixed = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        mixed = mixed.reshape(bsz, seqlen, self.mixer_heads, arteries, self.head_dim)
         with latency_section("mixer_out_layout"):
             mixed = mixed.transpose(2, 3).contiguous().reshape(bsz, seqlen, arteries, self.mixer_dim)
         mixed = self.proj(mixed)
